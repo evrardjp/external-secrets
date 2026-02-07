@@ -14,6 +14,8 @@ global:
   #    matchLabelKeys:
   #      - pod-template-hash
   affinity: {}
+  # -- Global hostAliases to be applied to all deployments
+  hostAliases: []
   # -- Global pod labels to be applied to all deployments
   podLabels: {}
   # -- Global pod annotations to be applied to all deployments
@@ -346,6 +348,8 @@ livenessProbe:
   spec:
     # -- Address for liveness probe.
     address: ""
+    # -- Named port for liveness probe.
+    port: 8082
     # -- Specify the maximum amount of time to wait for a probe to respond before considering it fails.
     timeoutSeconds: 5
     # -- Number of consecutive probe failures that should occur before considering the probe as failed.
@@ -358,9 +362,9 @@ livenessProbe:
     initialDelaySeconds: 10
     # -- Handler for liveness probe.
     httpGet:
-      # -- Set this value to 8082 to active liveness probes.
+      # -- Set this value to 'live' (for named port) or an an integer for liveness probes.
       # @schema type: [string, integer]
-      port: 8082
+      port: live
       # -- Path for liveness probe.
       path: /healthz
 
@@ -438,6 +442,9 @@ webhook:
     name: ""
   nodeSelector: {}
 
+  # -- Specifies `hostAliases` to webhook deployment
+  hostAliases: []
+
   certManager:
     # -- Enabling cert-manager support will disable the built in secret and
     # switch to using cert-manager (installed separately) to automatically issue
@@ -474,6 +481,14 @@ webhook:
       # since the webhook will check this far in advance that the certificate is
       # valid.
       renewBefore: ""
+      # -- Specific settings on the privateKey and its generation
+      privateKey: {}
+        # rotationPolicy: Always
+        # algorithm: RSA
+        # size: 2048
+      # -- Specific settings on the signatureAlgorithm used on the cert.
+      # signatureAlgorithm is only valid for cert-manager v1.18.0+
+      signatureAlgorithm: ""
       # -- Add extra annotations to the Certificate resource.
       annotations: {}
 
@@ -615,6 +630,9 @@ certController:
     name: ""
   nodeSelector: {}
 
+  # -- Specifies `hostAliases` to cert-controller deployment
+  hostAliases: []
+
   tolerations: []
 
   topologySpreadConstraints: []
@@ -718,6 +736,9 @@ dnsPolicy: ClusterFirst
 
 # -- Specifies `dnsOptions` to deployment
 dnsConfig: {}
+
+# -- Specifies `hostAliases` to deployment
+hostAliases: []
 
 # -- Any extra pod spec on the deployment
 podSpecExtra: {}
