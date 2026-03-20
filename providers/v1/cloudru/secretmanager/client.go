@@ -1,5 +1,5 @@
 /*
-Copyright © 2025 ESO Maintainer Team
+Copyright © The ESO Authors
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -107,10 +107,10 @@ func (c *Client) GetSecretMap(ctx context.Context, ref esv1.ExternalSecretDataRe
 	return out, nil
 }
 
-// GetAllSecrets gets all secrets by the remote reference.
+// GetAllSecrets returns all secrets matching the find criteria (path, name, tags).
 func (c *Client) GetAllSecrets(ctx context.Context, ref esv1.ExternalSecretFind) (map[string][]byte, error) {
-	if len(ref.Tags) == 0 && ref.Name == nil {
-		return nil, fmt.Errorf("at least one of the following fields must be set: tags, name")
+	if len(ref.Tags) == 0 && ref.Name == nil && ref.Path == nil {
+		return nil, fmt.Errorf("at least one of the following fields must be set: tags, name, path")
 	}
 
 	var nameFilter string
@@ -122,6 +122,9 @@ func (c *Client) GetAllSecrets(ctx context.Context, ref esv1.ExternalSecretFind)
 		ProjectID: c.projectID,
 		Labels:    ref.Tags,
 		NameRegex: nameFilter,
+	}
+	if ref.Path != nil {
+		searchReq.Path = *ref.Path
 	}
 	secrets, err := c.apiClient.ListSecrets(ctx, searchReq)
 	if err != nil {
