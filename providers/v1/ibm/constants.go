@@ -1,5 +1,3 @@
-//go:build tools
-
 /*
 Copyright © The ESO Authors
 
@@ -16,11 +14,12 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-package tools
+package ibm
 
-import (
-	_ "github.com/onsi/ginkgo/v2/ginkgo"
-	_ "github.com/onsi/ginkgo/v2/ginkgo/generators"
-	_ "github.com/onsi/ginkgo/v2/ginkgo/internal"
-	_ "github.com/onsi/ginkgo/v2/ginkgo/labels"
+// Metrics constants identify the IBM Secrets Manager provider and API calls.
+const (
+	ProviderIBMSM                = "IBM/SecretsManager"
+	CallIBMSMGetSecret           = "GetSecret"
+	CallIBMSMListSecrets         = "ListSecrets"
+	CallIBMSMGetSecretByNameType = "GetSecretByNameType"
 )

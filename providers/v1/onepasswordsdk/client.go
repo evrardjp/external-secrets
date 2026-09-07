@@ -30,7 +30,6 @@ import (
 	corev1 "k8s.io/api/core/v1"
 
 	esv1 "github.com/external-secrets/external-secrets/apis/externalsecrets/v1"
-	"github.com/external-secrets/external-secrets/runtime/constants"
 	"github.com/external-secrets/external-secrets/runtime/esutils/metadata"
 	"github.com/external-secrets/external-secrets/runtime/find"
 	"github.com/external-secrets/external-secrets/runtime/metrics"
@@ -43,6 +42,7 @@ const (
 	vaultCachePrefix  = "vault:"
 	itemCachePrefix   = "item:"
 	fileCachePrefix   = "file:"
+	envAllCachePrefix = "env-all:"
 	defaultFieldLabel = "password"
 
 	errMsgUpdateItem       = "failed to update item: %w"
@@ -50,8 +50,6 @@ const (
 	errMsgParsePushMeta    = "failed to parse push secret metadata: %w"
 	errMsgExpectedOneField = "found more than 1 fields with title '%s' in '%s', got %d"
 	errMsgExpectedOneFile  = "found more than 1 files with title '%s' in '%s', got %d"
-	errMsgFieldNotFound    = "field with label '%s' not found in item '%s'"
-	errMsgFileNotFound     = "file with title '%s' not found in item '%s'"
 )
 
 // ErrKeyNotFound is returned when a key is not found in the 1Password Vaults.
@@ -79,6 +77,10 @@ func (p *SecretsClient) GetSecret(ctx context.Context, ref esv1.ExternalSecretDa
 	if ref.Version != "" {
 		return nil, errors.New(errVersionNotImplemented)
 	}
+	if p.source == sourceEnvironment {
+		return p.getEnvironmentSecret(ctx, ref.Key)
+	}
+
 	key := p.constructRefKey(ref.Key)
 
 	if cached, ok := p.cacheGet(key); ok {
@@ -93,7 +95,7 @@ func (p *SecretsClient) GetSecret(ctx context.Context, ref esv1.ExternalSecretDa
 	}
 
 	secret, err := p.client.Secrets().Resolve(ctx, key)
-	metrics.ObserveAPICall(constants.ProviderOnePasswordSDK, constants.CallOnePasswordSDKResolve, err)
+	metrics.ObserveAPICall(ProviderOnePasswordSDK, CallOnePasswordSDKResolve, err)
 	if err != nil {
 		return nil, err
 	}
@@ -104,6 +106,80 @@ func (p *SecretsClient) GetSecret(ctx context.Context, ref esv1.ExternalSecretDa
 	return result, nil
 }
 
+// getEnvironmentSecret resolves a single variable from a 1Password Environment.
+func (p *SecretsClient) getEnvironmentSecret(ctx context.Context, name string) ([]byte, error) {
+	key := p.constructRefKey(name)
+	if cached, ok := p.cacheGet(key); ok {
+		return cached, nil
+	}
+
+	// If we didn't find the single value, let's get all the values and cache the single value
+	// with our special constructed key.
+	vars, err := p.fetchEnvironmentVariables(ctx)
+	if err != nil {
+		return nil, err
+	}
+
+	// As of this writing, the SDK does not support getting a single key. It either gets everything or it doesn't.
+	for _, v := range vars {
+		if v.Name == name {
+			result := []byte(v.Value)
+			p.cacheAdd(key, result)
+			return result, nil
+		}
+	}
+
+	return nil, ErrKeyNotFound
+}
+
+// fetchEnvironmentVariables returns all variables from the configured 1Password Environment.
+// The aggregated response is cached under a synthetic key so subsequent GetSecret/GetSecretMap
+// calls within the TTL avoid re-hitting the API.
+func (p *SecretsClient) fetchEnvironmentVariables(ctx context.Context) ([]onepassword.EnvironmentVariable, error) {
+	allKey := envAllCachePrefix + p.targetID
+	if cached, ok := p.cacheGet(allKey); ok {
+		var vars []onepassword.EnvironmentVariable
+		if err := json.Unmarshal(cached, &vars); err == nil {
+			return vars, nil
+		}
+	}
+
+	resp, err := p.client.Environments().GetVariables(ctx, p.targetID)
+	metrics.ObserveAPICall(ProviderOnePasswordSDK, CallOnePasswordSDKEnvironmentsGetVars, err)
+	if err != nil {
+		return nil, fmt.Errorf("failed to get environment variables: %w", err)
+	}
+
+	if serialized, err := json.Marshal(resp.Variables); err == nil {
+		p.cacheAdd(allKey, serialized)
+	}
+
+	return resp.Variables, nil
+}
+
+// getEnvironmentSecretMap returns variables from a 1Password Environment as a map.
+// If ref.Property is set, only that variable is returned.
+func (p *SecretsClient) getEnvironmentSecretMap(ctx context.Context, ref esv1.ExternalSecretDataRemoteRef) (map[string][]byte, error) {
+	vars, err := p.fetchEnvironmentVariables(ctx)
+	if err != nil {
+		return nil, err
+	}
+
+	out := make(map[string][]byte)
+	for _, v := range vars {
+		if ref.Property != "" && v.Name != ref.Property {
+			continue
+		}
+		out[v.Name] = []byte(v.Value)
+	}
+
+	if ref.Property != "" && len(out) == 0 {
+		return nil, ErrKeyNotFound
+	}
+
+	return out, nil
+}
+
 // Close closes the client connection.
 func (p *SecretsClient) Close(_ context.Context) error {
 	return nil
@@ -111,6 +187,9 @@ func (p *SecretsClient) Close(_ context.Context) error {
 
 // DeleteSecret implements Secret Deletion on the provider when PushSecret.spec.DeletionPolicy=Delete.
 func (p *SecretsClient) DeleteSecret(ctx context.Context, ref esv1.PushSecretRemoteRef) (err error) {
+	if p.source == sourceEnvironment {
+		return fmt.Errorf(errOnePasswordSdkEnvironmentReadOnly, "DeleteSecret")
+	}
 	providerItem, err := p.findItem(ctx, ref.GetRemoteKey())
 	if errors.Is(err, ErrKeyNotFound) {
 		// Since the item no longer exists upstream, it's safe to remove it from the cache.
@@ -150,7 +229,7 @@ func (p *SecretsClient) DeleteSecret(ctx context.Context, ref esv1.PushSecretRem
 
 	if len(providerItem.Fields) == 0 && len(providerItem.Files) == 0 && len(providerItem.Sections) == 0 {
 		err = p.client.Items().Delete(ctx, providerItem.VaultID, providerItem.ID)
-		metrics.ObserveAPICall(constants.ProviderOnePasswordSDK, constants.CallOnePasswordSDKItemsDelete, err)
+		metrics.ObserveAPICall(ProviderOnePasswordSDK, CallOnePasswordSDKItemsDelete, err)
 		if err != nil {
 			return fmt.Errorf("failed to delete item: %w", err)
 		}
@@ -158,7 +237,7 @@ func (p *SecretsClient) DeleteSecret(ctx context.Context, ref esv1.PushSecretRem
 	}
 
 	_, err = p.client.Items().Put(ctx, providerItem)
-	metrics.ObserveAPICall(constants.ProviderOnePasswordSDK, constants.CallOnePasswordSDKItemsPut, err)
+	metrics.ObserveAPICall(ProviderOnePasswordSDK, CallOnePasswordSDKItemsPut, err)
 	if err != nil {
 		return fmt.Errorf(errMsgUpdateItem, err)
 	}
@@ -189,6 +268,18 @@ func deleteField(fields []onepassword.ItemField, title string) ([]onepassword.It
 
 // GetAllSecrets syncs multiple 1Password Items into a single Kubernetes Secret, for dataFrom.find.
 func (p *SecretsClient) GetAllSecrets(ctx context.Context, ref esv1.ExternalSecretFind) (map[string][]byte, error) {
+	if p.source == sourceEnvironment {
+		vars, err := p.fetchEnvironmentVariables(ctx)
+		if err != nil {
+			return nil, err
+		}
+		out := make(map[string][]byte, len(vars))
+		for _, v := range vars {
+			out[v.Name] = []byte(v.Value)
+		}
+		return out, nil
+	}
+
 	items, err := p.listItems(ctx)
 	if err != nil {
 		return nil, err
@@ -262,6 +353,9 @@ func (p *SecretsClient) GetSecretMap(ctx context.Context, ref esv1.ExternalSecre
 	if ref.Version != "" {
 		return nil, errors.New(errVersionNotImplemented)
 	}
+	if p.source == sourceEnvironment {
+		return p.getEnvironmentSecretMap(ctx, ref)
+	}
 
 	cacheKey := p.constructRefKey(ref.Key) + "|" + ref.Property
 	if cached, ok := p.cacheGet(cacheKey); ok {
@@ -299,7 +393,7 @@ func (p *SecretsClient) GetSecretMap(ctx context.Context, ref esv1.ExternalSecre
 func (p *SecretsClient) listItems(ctx context.Context) ([]onepassword.ItemOverview, error) {
 	var items []onepassword.ItemOverview
 
-	cacheKey := vaultCachePrefix + p.vaultID
+	cacheKey := vaultCachePrefix + p.targetID
 	if cached, ok := p.cacheGet(cacheKey); ok {
 		if err := json.Unmarshal(cached, &items); err == nil {
 			return items, nil
@@ -307,8 +401,8 @@ func (p *SecretsClient) listItems(ctx context.Context) ([]onepassword.ItemOvervi
 	}
 
 	// Vault item list not found in cache - fetch from the API
-	items, err := p.client.Items().List(ctx, p.vaultID)
-	metrics.ObserveAPICall(constants.ProviderOnePasswordSDK, constants.CallOnePasswordSDKItemsList, err)
+	items, err := p.client.Items().List(ctx, p.targetID)
+	metrics.ObserveAPICall(ProviderOnePasswordSDK, CallOnePasswordSDKItemsList, err)
 	if err != nil {
 		return nil, fmt.Errorf("failed to list items: %w", err)
 	}
@@ -380,12 +474,12 @@ func (p *SecretsClient) getAllFields(item onepassword.Item, ref esv1.ExternalSec
 // TODO - Currently, cached files are not invalidated on updates. This should be done as part of the cache refactor.
 // See GitHub issue: https://github.com/external-secrets/external-secrets/issues/6444
 func (p *SecretsClient) fetchFile(ctx context.Context, itemID, fieldID string, attributes onepassword.FileAttributes) ([]byte, error) {
-	cacheKey := fileCachePrefix + p.vaultID + ":" + itemID + ":" + fieldID + ":" + attributes.Name
+	cacheKey := fileCachePrefix + p.targetID + ":" + itemID + ":" + fieldID + ":" + attributes.Name
 	if cached, ok := p.cacheGet(cacheKey); ok {
 		return cached, nil
 	}
-	contents, err := p.client.Items().Files().Read(ctx, p.vaultID, fieldID, attributes)
-	metrics.ObserveAPICall(constants.ProviderOnePasswordSDK, constants.CallOnePasswordSDKFilesRead, err)
+	contents, err := p.client.Items().Files().Read(ctx, p.targetID, fieldID, attributes)
+	metrics.ObserveAPICall(ProviderOnePasswordSDK, CallOnePasswordSDKFilesRead, err)
 	if err != nil {
 		return nil, fmt.Errorf("failed to read file: %w", err)
 	}
@@ -510,14 +604,14 @@ func (p *SecretsClient) createItem(ctx context.Context, val []byte, ref esv1.Pus
 
 	createdItem, err := p.client.Items().Create(ctx, onepassword.ItemCreateParams{
 		Category: onepassword.ItemCategoryServer,
-		VaultID:  p.vaultID,
+		VaultID:  p.targetID,
 		Title:    ref.GetRemoteKey(),
 		Fields: []onepassword.ItemField{
 			generateNewItemField(label, string(val), fieldType),
 		},
 		Tags: tags,
 	})
-	metrics.ObserveAPICall(constants.ProviderOnePasswordSDK, constants.CallOnePasswordSDKItemsCreate, err)
+	metrics.ObserveAPICall(ProviderOnePasswordSDK, CallOnePasswordSDKItemsCreate, err)
 	if err != nil {
 		return fmt.Errorf(errMsgCreateItem, err)
 	}
@@ -608,6 +702,9 @@ func generateNewItemField(title, newVal string, fieldType onepassword.ItemFieldT
 
 // PushSecret creates or updates a secret in 1Password.
 func (p *SecretsClient) PushSecret(ctx context.Context, secret *corev1.Secret, ref esv1.PushSecretData) error {
+	if p.source == sourceEnvironment {
+		return fmt.Errorf(errOnePasswordSdkEnvironmentReadOnly, "PushSecret")
+	}
 	if ref.GetSecretKey() == "" {
 		return p.pushAllKeys(ctx, secret, ref)
 	}
@@ -651,7 +748,7 @@ func (p *SecretsClient) PushSecret(ctx context.Context, secret *corev1.Secret, r
 	}
 
 	_, err = p.client.Items().Put(ctx, providerItem)
-	metrics.ObserveAPICall(constants.ProviderOnePasswordSDK, constants.CallOnePasswordSDKItemsPut, err)
+	metrics.ObserveAPICall(ProviderOnePasswordSDK, CallOnePasswordSDKItemsPut, err)
 	if err != nil {
 		return fmt.Errorf(errMsgUpdateItem, err)
 	}
@@ -669,12 +766,12 @@ func (p *SecretsClient) createAllKeysItem(ctx context.Context, secret *corev1.Se
 	}
 	createdItem, err := p.client.Items().Create(ctx, onepassword.ItemCreateParams{
 		Category: onepassword.ItemCategoryServer,
-		VaultID:  p.vaultID,
+		VaultID:  p.targetID,
 		Title:    title,
 		Fields:   fields,
 		Tags:     tags,
 	})
-	metrics.ObserveAPICall(constants.ProviderOnePasswordSDK, constants.CallOnePasswordSDKItemsCreate, err)
+	metrics.ObserveAPICall(ProviderOnePasswordSDK, CallOnePasswordSDKItemsCreate, err)
 	if err != nil {
 		return fmt.Errorf(errMsgCreateItem, err)
 	}
@@ -728,7 +825,7 @@ func (p *SecretsClient) pushAllKeys(ctx context.Context, secret *corev1.Secret, 
 	}
 	providerItem.Fields = kept
 	_, err = p.client.Items().Put(ctx, providerItem)
-	metrics.ObserveAPICall(constants.ProviderOnePasswordSDK, constants.CallOnePasswordSDKItemsPut, err)
+	metrics.ObserveAPICall(ProviderOnePasswordSDK, CallOnePasswordSDKItemsPut, err)
 	if err != nil {
 		return fmt.Errorf(errMsgUpdateItem, err)
 	}
@@ -739,7 +836,7 @@ func (p *SecretsClient) pushAllKeys(ctx context.Context, secret *corev1.Secret, 
 // GetVault retrieves a vault by its title or UUID from 1Password.
 func (p *SecretsClient) GetVault(ctx context.Context, titleOrUUID string) (string, error) {
 	vaults, err := p.client.VaultsAPI.List(ctx)
-	metrics.ObserveAPICall(constants.ProviderOnePasswordSDK, constants.CallOnePasswordSDKVaultsList, err)
+	metrics.ObserveAPICall(ProviderOnePasswordSDK, CallOnePasswordSDKVaultsList, err)
 	if err != nil {
 		return "", fmt.Errorf("failed to list vaults: %w", err)
 	}
@@ -755,7 +852,7 @@ func (p *SecretsClient) GetVault(ctx context.Context, titleOrUUID string) (strin
 
 // fetchItemByID retrieves an item by its ID, using the cache if possible.
 func (p *SecretsClient) fetchItemByID(ctx context.Context, id string) (onepassword.Item, error) {
-	cacheKey := itemCachePrefix + p.vaultID + ":" + id
+	cacheKey := itemCachePrefix + p.targetID + ":" + id
 	if cached, ok := p.cacheGet(cacheKey); ok {
 		var item onepassword.Item
 		if err := json.Unmarshal(cached, &item); err == nil {
@@ -763,8 +860,8 @@ func (p *SecretsClient) fetchItemByID(ctx context.Context, id string) (onepasswo
 		}
 	}
 
-	item, err := p.client.Items().Get(ctx, p.vaultID, id)
-	metrics.ObserveAPICall(constants.ProviderOnePasswordSDK, constants.CallOnePasswordSDKItemsGet, err)
+	item, err := p.client.Items().Get(ctx, p.targetID, id)
+	metrics.ObserveAPICall(ProviderOnePasswordSDK, CallOnePasswordSDKItemsGet, err)
 	if err != nil {
 		return onepassword.Item{}, err
 	}
@@ -777,7 +874,7 @@ func (p *SecretsClient) fetchItemByID(ctx context.Context, id string) (onepasswo
 
 // findItem retrieves an item by its title or ID, using the cache if possible.
 func (p *SecretsClient) findItem(ctx context.Context, name string) (onepassword.Item, error) {
-	cacheKey := itemCachePrefix + p.vaultID + ":" + name
+	cacheKey := itemCachePrefix + p.targetID + ":" + name
 	if cached, ok := p.cacheGet(cacheKey); ok {
 		var item onepassword.Item
 		if err := json.Unmarshal(cached, &item); err == nil {
@@ -841,7 +938,7 @@ func (p *SecretsClient) resolveFieldFromCachedItem(refKey string) ([]byte, bool)
 		return nil, false
 	}
 
-	cached, ok := p.cacheGet(itemCachePrefix + p.vaultID + ":" + itemName)
+	cached, ok := p.cacheGet(itemCachePrefix + p.targetID + ":" + itemName)
 	if !ok {
 		return nil, false
 	}
@@ -865,6 +962,9 @@ func (p *SecretsClient) resolveFieldFromCachedItem(refKey string) ([]byte, bool)
 
 // SecretExists returns true if the item exists, and if a property is specified, if a field with that title exists.
 func (p *SecretsClient) SecretExists(ctx context.Context, ref esv1.PushSecretRemoteRef) (bool, error) {
+	if p.source == sourceEnvironment {
+		return false, fmt.Errorf(errOnePasswordSdkEnvironmentReadOnly, "SecretExists")
+	}
 	item, err := p.findItem(ctx, ref.GetRemoteKey())
 	if errors.Is(err, ErrKeyNotFound) {
 		return false, nil
@@ -893,8 +993,8 @@ func (p *SecretsClient) Validate() (esv1.ValidationResult, error) {
 }
 
 func (p *SecretsClient) constructRefKey(key string) string {
-	// remove any possible leading slashes because the vaultPrefix already contains it.
-	return p.vaultPrefix + strings.TrimPrefix(key, "/")
+	// remove any possible leading slashes because targetPrefix already contains it.
+	return p.targetPrefix + strings.TrimPrefix(key, "/")
 }
 
 // cacheGet retrieves a value from the cache. Returns false if cache is disabled or key not found.
@@ -955,12 +1055,12 @@ func (p *SecretsClient) invalidateItem(item onepassword.Item) {
 		p.invalidateCacheByPrefix(p.constructRefKey(item.ID))
 	}
 
-	p.cache.Remove(itemCachePrefix + p.vaultID + ":" + item.Title)
+	p.cache.Remove(itemCachePrefix + p.targetID + ":" + item.Title)
 	if item.ID != "" {
-		p.cache.Remove(itemCachePrefix + p.vaultID + ":" + item.ID)
+		p.cache.Remove(itemCachePrefix + p.targetID + ":" + item.ID)
 	}
 
-	p.cache.Remove(vaultCachePrefix + p.vaultID)
+	p.cache.Remove(vaultCachePrefix + p.targetID)
 }
 
 func isNotFoundError(err error) bool {

@@ -1,5 +1,3 @@
-//go:build tools
-
 /*
 Copyright © The ESO Authors
 
@@ -16,11 +14,16 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-package tools
+package vault
 
-import (
-	_ "github.com/ahmetb/gen-crd-api-reference-docs"
-	_ "github.com/maxbrunsfeld/counterfeiter/v6"
-	_ "github.com/onsi/ginkgo/v2/ginkgo"
-	_ "sigs.k8s.io/controller-tools/cmd/controller-gen"
+// Metrics constants identify the HashiCorp Vault provider and API calls.
+const (
+	ProviderHCVault            = "HashiCorp/Vault"
+	CallHCVaultLogin           = "Login"
+	CallHCVaultRevokeSelf      = "RevokeSelf"
+	CallHCVaultLookupSelf      = "LookupSelf"
+	CallHCVaultReadSecretData  = "ReadSecretData"
+	CallHCVaultWriteSecretData = "WriteSecretData"
+	CallHCVaultDeleteSecret    = "DeleteSecret"
+	CallHCVaultListSecrets     = "ListSecrets"
 )
